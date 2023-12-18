@@ -1,11 +1,9 @@
 
 from tqdm import tqdm
 import numpy as np
-from skimage import img_as_ubyte
 
 import argparse
 from pathlib import Path
-import xml.etree.ElementTree as ET
 import os, sys
 
 try:
@@ -25,41 +23,26 @@ import logging
 
 from brachistools.segmentation import segmentation_pipeline, default_segmentation_params
 # TODO: Import components
-# from brachistools.classification import ...
-from brachistools.io import load_folder, imread, imsave, labels_to_xml, xml_to_labels
+from brachistools.classification import classification_pipeline
+from brachistools.io import load_folder, imread, imsave, labels_to_xml
 from brachistools.version import version_str
 
 def get_arg_parser():
     parser = argparse.ArgumentParser(description="Brachistools Command Line Parameters")
     parser.add_argument('--verbose', action='store_true', help="print additional messages")
 
-
-    common_parser = argparse.ArgumentParser(add_help=False)
-    input_img_args = common_parser.add_argument_group("Input Image Arguments")
-    input_img_args.add_argument('--dir', default=[], type=str, help='folder containing data to run on')
-    input_img_args.add_argument('--image_path', default=[], type=str,
-                                help='run on single image')
-    input_img_args.add_argument('--ignored_suffixes', default=['_mask', '_xml2seg'],
-                                type=str, nargs='+', required=False,
-                                help='ignore file if its root name ends with these suffixes')
-    output_args = common_parser.add_argument_group("Output Arguments")
-    output_args.add_argument('--save_format', required=False, default='PNG', type=str,
-                             help="the file extension (no dot) of saved binary masks. Default is 'PNG'")
-    output_args.add_argument('--save_dir', default=None, type=str,
-                             help="folder to which segmentation results will be saved (defaults to input image directory)")
-    output_args.add_argument('--save_npy', action='store_true',
-                             help="save instance segmentation results as '.npy' labeled mask arrays. "
-                             "For instance segmentation, the XML format will always be saved regardless of "
-                             "this option")
+    parser.add_argument('command', type=str, choices=['segment', 'classify', 'config', 'gui', 'version'])
 
     subparsers = parser.add_subparsers(dest='command')
 
-    segment_subparser = subparsers.add_parser('segment', parents=[common_parser], help="Perform segmentation")
-    classify_subparser = subparsers.add_parser('classify', parents=[common_parser], help="Perform classification (suggest diagnosis)")
-    config_subparser = subparsers.add_parser('config', help="Edit program configurations")
-    show_subparser = subparsers.add_parser('show', parents=[common_parser], help="Generate labels for segmentation XML")
-    gui_subparser = subparsers.add_parser('gui', help="Launch GUI application")
-    version_subparser = subparsers.add_parser('version', help="Show version info")
+    segment_subparser = subparsers.add_parser('segment', help="perform segmentation")
+    classify_subparser = subparsers.add_parser('classify', help="perform classification (suggest diagnosis)")
+    config_subparser = subparsers.add_parser('config', help="program configurations")
+
+    input_img_args = parser.add_argument_group("Input Image Arguments")
+    input_img_args.add_argument('--dir', default=[], type=str, help='folder containing data to run on')
+    input_img_args.add_argument('--image_path', default=[], type=str,
+                                help='run on single image')
 
     segmentation_args = segment_subparser.add_argument_group("Segmentation Pipeline Arguments")
     segmentation_args.add_argument('--vahadane-sparsity_regularizer',
@@ -109,6 +92,15 @@ def get_arg_parser():
     config_subparser.add_argument('--param_dir', required=False, default='models', type=str,
                                   help="folder of model parameters")
 
+    output_args = parser.add_argument_group("Output Arguments")
+    output_args.add_argument('--save_format', required=False, default='PNG', type=str,
+                             help="the file extension (no dot) of saved binary masks. Default is 'PNG'")
+    output_args.add_argument('--save_dir', default=None, type=str,
+                             help="folder to which segmentation results will be saved (defaults to input image directory)")
+    output_args.add_argument('--save_npy', action='store_true',
+                             help="save instance segmentation results as '.npy' labeled mask arrays. "
+                             "The XML format for instance segmentation will always be saved regardless of "
+                             "this option")
     return parser
 
 def main():
@@ -134,7 +126,6 @@ def main():
             if GUI_IMPORT:
                 print('GUI FAILED: GUI dependencies may not be installed, to install, run')
                 print('     pip install "brachistools[gui]"')
-            sys.exit(-1)
         else:
             gui.run()
 
@@ -160,15 +151,8 @@ def main():
         logger.critical("Cannot specify both --dir and --image_path")
         sys.exit(-1)
 
-    if args.command == 'show':
-        file_ext = 'XML'
-    else:
-        file_ext = ['PNG', 'JPG', 'JPEG']
-
     if args.dir:
-        image_names = load_folder(args.dir,
-            file_ext=file_ext, absolute_path=False,
-            ignored_suffixes=args.ignored_suffixes)
+        image_names = load_folder(args.dir, file_ext=['PNG', 'JPG', 'JPEG'], absolute_path=True)
         if len(image_names) > 1:
             image_names = tqdm(image_names)
     elif args.image_path:
@@ -181,30 +165,6 @@ def main():
     if not args.save_dir:
         args.save_dir = args.dir
 
-    def savepath(fn):
-        return os.path.join(args.save_dir, fn)
-
-    if args.command == 'show':
-        # from brachistools.io import HAVE_MATPLOTLIB
-        # if not HAVE_MATPLOTLIB:
-        #     logger.info("Showing segmentation XMLs requires matplotlib. Saving picture only")
-
-        for seg_xml in image_names:
-            try:
-                root_fn, old_ext = os.path.splitext(seg_xml)
-                if root_fn.endswith('_seg'):
-                    root_fn = root_fn[:-4]
-
-                tree = ET.parse(os.path.join(args.dir, seg_xml))
-                labels, pic = xml_to_labels(tree, use_tqdm=len(image_names)==1)
-                imsave(savepath(root_fn + '_xml2seg.PNG'), pic)
-                if args.save_npy:
-                    np.save(savepath(root_fn + '_xml2seg.npy'), labels)
-            except Exception as e:
-                logger.critical(
-                    "Failed to transform segmentation XML '{}' "
-                    "due to exception: {}", seg_xml, e)
-
     if args.command == 'segment':
         segment_params = default_segmentation_params.copy()
         segment_params['vahadane:sparsity_regularizer'] = args.vahadane_sparsity_regularizer
@@ -216,24 +176,23 @@ def main():
         segment_params['merge_small_labels:min_size'] = args.small_labels_min_size
 
         for fn in image_names:
-            try:
-                image = imread(os.path.join(args.dir, fn))
-                nucleus, labeled_nucleus = segmentation_pipeline(image, segment_params)
+            image = imread(fn)
+            nucleus, labeled_nucleus = segmentation_pipeline(image, segment_params)
 
-                root, old_ext = os.path.splitext(fn)
-                imsave(savepath(f"{root}_mask.{args.save_format}"), img_as_ubyte(nucleus))
-                labels_to_xml(labeled_nucleus).write(savepath(f"{root}_seg.xml"))
+            root, old_ext = os.path.splitext(fn)
+            imsave(f"{root}_mask.{args.save_format}", nucleus)
+            labels_to_xml(labeled_nucleus).write(f"{root}_seg.xml")
 
-                if args.save_npy:
-                    np.save(savepath(root + '_mask.npy'), nucleus)
-                    np.save(savepath(root + '_mask_labels.npy'), labeled_nucleus)
-            except Exception as e:
-                logger.critical(
-                    "Failed to segmentation picture '{}' "
-                    "due to exception: {}", fn, e)
+            if args.save_npy:
+                np.save(root + '_mask.npy', nucleus)
+                np.save(root + '_mask_labels.npy', labeled_nucleus)
 
     if args.command == 'classify':
-        ...
+        for fn in image_names:
+            image = imread(fn)
+            predict_class, confidence_score = classification_pipeline(image)
+            print(f"Predict : {predict_class}\nConfidence : {confidence_score}")
+
 
 if __name__ == "__main__":
     main()
