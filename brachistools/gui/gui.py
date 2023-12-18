@@ -22,12 +22,11 @@ from qtpy.QtWidgets import (
     QWidget,
     QAction)
 
-from brachistools.gui.io import load_folder, imread, imsave, abbrev_path
+from brachistools.gui.io import load_folder, imread, abbrev_path
 
 from brachistools.version import brachistools_version
 from brachistools.segmentation import segmentation_pipeline, default_segmentation_params, label2rgb_bbox
 from brachistools.classification import classification_pipeline
-from brachistools.io import labels_to_xml
 
 global logger
 def run():
@@ -58,7 +57,7 @@ class Segment1Thread(QtCore.QThread):
         self.vahadane_transform = vahadane(**params['vahadane'])
 
     def run(self):
-        from skimage import img_as_ubyte
+        from skimage.util import img_as_ubyte
         from brachistools.segmentation import (
             vahadane, equalize_adapthist,
             inverted_gray_scale, threshold_otsu,
@@ -101,11 +100,36 @@ class Segment1Thread(QtCore.QThread):
         self.nuclei = nuclei
         self.labeled_nuclei = labeled_nuclei
 
+class Classify1Thread(QtCore.QThread):
+    MAX_PROGRESS = 11
+
+    update_progress = QtCore.Signal(int)
+
+    def __init__(self, input_image, parent=None):
+        super().__init__(parent)
+
+        self.input_image = input_image
+
+
+    def run(self):
+        import cv2
+        import numpy as np
+        from brachistools.classification import (
+            load_classification_model
+        )
+
+        img = cv2.resize(self.input_image, (224, 224))
+        img = np.array(img)
+        predict_class, confidence_score = load_classification_model(img)
+        self.predict_class = predict_class
+        self.confidence_score = confidence_score
+
+
 class SegmentationWindow(QMainWindow):
     def __init__(self, parent, img_fn) -> None:
         super().__init__(parent)
 
-        self.setGeometry(50, 50, 1500, 550)
+        self.setGeometry(50, 50, 1500, 500)
         self.setWindowTitle("Segmentation results of " + img_fn)
 
         self.cwidget = QWidget(self)
@@ -117,11 +141,9 @@ class SegmentationWindow(QMainWindow):
         self.OrigImgLabel = QLabel()
         self.InstanceSegLabel = QLabel()
         self.BinaryMaskLabel = QLabel()
-        self.SaveButton = QPushButton('Save masks')
 
         self._init_ui_components()
 
-        self._img_fn = img_fn
         self._orig_img = None
         self._binary_mask = None
         self._instance_seg = None
@@ -136,20 +158,8 @@ class SegmentationWindow(QMainWindow):
         self.BinaryMaskLabel.setFixedSize(500, 500)
         self.l0.addWidget(self.BinaryMaskLabel, 0, 2)
 
-        self.SaveButton.clicked.connect(self.save_masks)
-        self.l0.addWidget(self.SaveButton, 1, 2, QtCore.Qt.AlignmentFlag.AlignRight)
-
-    def save_masks(self):
-        from skimage import img_as_ubyte
-        root, old_ext = os.path.splitext(self._img_fn)
-        save_dir = QFileDialog.getExistingDirectory(self, "Select save directory")
-        imsave(os.path.join(save_dir, f"{root}_mask.PNG"), img_as_ubyte(self._binary_mask))
-        labels_to_xml(self._instance_seg).write(
-            os.path.join(save_dir, f"{root}_seg.xml"))
-        QMessageBox.information(self, "Masks saved", "You have saved the binary mask and nuclei regions.")
-
     def _set_img_for_label(self, lab: QLabel, imarr):
-        from skimage import img_as_ubyte
+        from skimage.util import img_as_ubyte
 
         imarr = img_as_ubyte(imarr)
         if len(imarr.shape) < 3:
@@ -177,6 +187,7 @@ class SegmentationWindow(QMainWindow):
     def set_binary_mask(self, imarr):
         self._binary_mask = imarr
         self._set_img_for_label(self.BinaryMaskLabel, imarr)
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -243,8 +254,7 @@ class MainWindow(QMainWindow):
             parent=self)
 
         segment_progress = QProgressDialog(self)
-        segment_progress.setFixedSize(300, 150)
-        segment_progress.setWindowTitle("Segmentation in progress")
+        segment_progress.setWindowTitle("Segmentation in progress...")
         segment_progress.setLabelText("Please wait")
         segment_progress.setRange(0, Segment1Thread.MAX_PROGRESS)
         segment_progress.setModal(True)
@@ -255,13 +265,32 @@ class MainWindow(QMainWindow):
         segment_progress.exec()
 
         nuclei, labeled_nuclei = segment_thread.nuclei, segment_thread.labeled_nuclei
-        label_names = set(labeled_nuclei.flat)
-        label_names.discard(0)
-        self.CellCountTextEdit.setPlainText(str(len(label_names)))
+        self.CellCountTextEdit.setPlainText(str(len(set(labeled_nuclei.flat))))
         self.segmentation_window(nuclei=nuclei, labeled_nuclei=labeled_nuclei)
 
     def classify_current(self):
-        ...
+        if self._curr_img is None:
+            QMessageBox.critical(self, "Invalid operation", "Please select an image")
+            return
+
+        classify_thread = Classify1Thread(
+            input_image=self._curr_img,
+            parent=self
+        )
+
+        classify_progress = QProgressDialog(self)
+        classify_progress.setWindowTitle("Classification in progress...")
+        classify_progress.setLabelText("Please wait")
+        classify_progress.setRange(0, Classify1Thread.MAX_PROGRESS)
+        classify_progress.setModal(True)
+        classify_progress.canceled.connect(classify_thread.quit)
+        classify_thread.finished.connect(classify_progress.accept)
+        classify_thread.update_progress.connect(classify_progress.setValue)
+        classify_thread.start()
+        classify_progress.exec()
+
+        predict_class, confidence_score = classify_thread.predict_class, classify_thread.confidence_score
+        self.DiagnosisTextEdit.setPlainText(f"Predict : {predict_class}\nConfidence : {confidence_score}")
 
     def segment_all(self):
         QMessageBox.critical(self, "Not supported", "Sorry, this option is under development")
@@ -331,7 +360,7 @@ class MainWindow(QMainWindow):
 
         self.clear_panel()
 
-        input_filenames = load_folder(folder_path, ['PNG', 'JPG', 'JPEG'])
+        input_filenames = load_folder(folder_path, ['.PNG', '.JPG', '.JPEG'])
         if not input_filenames:
             QMessageBox.critical(self, "Invalid operation", "Input folder does not contain any PNG/JPG files")
         else:
