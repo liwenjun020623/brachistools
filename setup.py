@@ -20,6 +20,8 @@ install_deps = [
     # 'opencv-python-headless',
     # 'fastremap',
     # 'imagecodecs',
+    'keras',
+    'opencv-python'
 ]
 
 gui_deps = [
